@@ -21,8 +21,7 @@ def get_db_connection(config):
         print(f"Error connecting to database: {e}")
         return None
 
-def collect_query_stats(conn):
-    """Collects query statistics using pg_stat_statements."""
+def collect_query_stats(conn, config):
     try:
         with conn.cursor() as cur:
             # Check if pg_stat_statements extension is enabled
@@ -31,21 +30,20 @@ def collect_query_stats(conn):
                 print("Warning: pg_stat_statements extension is not enabled. Skipping query stats.")
                 return []
 
-            # Get current timestamp for the report
-            import time
-            start_time = time.time()
+            # Get capture duration from config, default to 60 seconds
+            capture_duration = int(config.get('collection', {}).get('capture_duration_seconds', 60))
             
             print("\n=== Query Collection Started ===")
             print("1. First, we'll reset the query statistics")
             cur.execute("SELECT pg_stat_statements_reset()")
             
-            print("2. Now, please run your application queries for the next 60 seconds...")
+            print(f"2. Now, please run your application queries for the next {capture_duration} seconds...")
             print("   (This gives you time to trigger the custom queries you want to profile)")
             print("   Press Ctrl+C to stop early if you've run your queries\n")
             
             try:
-                # Wait for 60 seconds to capture queries
-                for i in range(60, 0, -1):
+                # Wait for the configured duration to capture queries
+                for i in range(capture_duration, 0, -1):
                     print(f"\rTime remaining: {i} seconds (or press Ctrl+C to stop) ", end="")
                     time.sleep(1)
                 print("\n")
@@ -215,7 +213,7 @@ def main():
         
         # Collect query statistics
         print("Collecting query performance data...")
-        query_stats = collect_query_stats(conn)
+        query_stats = collect_query_stats(conn, config)
         
         # Collect table sizes
         print("Collecting table size information...")
