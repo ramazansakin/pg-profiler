@@ -13,7 +13,8 @@ def get_db_connection(config):
             port=config['postgresql']['port'],
             database=config['postgresql']['database'],
             user=config['postgresql']['user'],
-            password=config['postgresql']['password']
+            password=config['postgresql']['password'],
+            connect_timeout=5
         )
         return conn
     except psycopg2.Error as e:
@@ -30,138 +31,93 @@ def collect_query_stats(conn):
                 print("Warning: pg_stat_statements extension is not enabled. Skipping query stats.")
                 return []
 
+            # Reset stats to get fresh data
+            cur.execute("SELECT pg_stat_statements_reset()")
+            
+            # Wait a bit to capture some queries
+            print("Capturing query stats for 5 seconds...")
+            import time
+            time.sleep(5)
+            
+            # Get the top 50 queries by total execution time
             cur.execute("""
                 SELECT
                     query,
                     calls,
-                    total_exec_time,
-                    mean_exec_time,
-                    min_exec_time,
-                    max_exec_time,
-                    blk_read_time,
-                    blk_write_time
+                    ROUND(total_exec_time::numeric, 2) as total_ms,
+                    ROUND(mean_exec_time::numeric, 2) as avg_ms,
+                    ROUND(min_exec_time::numeric, 2) as min_ms,
+                    ROUND(max_exec_time::numeric, 2) as max_ms,
+                    ROUND((total_exec_time / NULLIF(calls, 0) / 1000)::numeric, 4) as avg_seconds
                 FROM
                     pg_stat_statements
+                WHERE
+                    query NOT LIKE '%pg_%'  -- Exclude PostgreSQL internal queries
+                    AND query NOT LIKE '%information_schema%'
                 ORDER BY
                     total_exec_time DESC
-                LIMIT 100;
+                LIMIT 50;
             """)
             return cur.fetchall()
     except psycopg2.Error as e:
         print(f"Error collecting query stats: {e}")
         return []
 
-def collect_resource_usage(conn):
-    """Collects general resource usage from pg_stat_database and pg_stat_bgwriter."""
+def collect_database_stats(conn):
+    """Collects basic database statistics."""
     try:
         with conn.cursor() as cur:
-            # pg_stat_database for cache hit ratio
+            # Get cache hit ratio
             cur.execute("""
                 SELECT
-                    datname,
-                    blks_read,
-                    blks_hit,
-                    (blks_hit * 100) / (blks_read + blks_hit) AS hit_ratio
+                    ROUND((blks_hit * 100.0) / NULLIF((blks_read + blks_hit), 0), 2) AS cache_hit_ratio
                 FROM
                     pg_stat_database
                 WHERE
                     datname = current_database();
             """)
-            db_stats = cur.fetchone()
-
-            # pg_stat_bgwriter for buffer activity
+            cache_hit_ratio = cur.fetchone()[0] or 0
+            
+            # Get database size
             cur.execute("""
-                SELECT
-                    checkpoints_timed,
-                    checkpoints_req,
-                    buffers_alloc,
-                    buffers_backend,
-                    buffers_backend_fsync,
-                    buffers_checkpoint,
-                    buffers_clean,
-                    maxwritten_clean,
-                    (buffers_alloc / (EXTRACT(EPOCH FROM (now() - stats_reset))))::numeric(10,2) AS buff_alloc_rate,
-                    ((checkpoints_timed + checkpoints_req) / (EXTRACT(EPOCH FROM (now() - stats_reset))))::numeric(10,2) AS checkpoints_rate
-                FROM
-                    pg_stat_bgwriter;
+                SELECT pg_size_pretty(pg_database_size(current_database()))
             """)
-            bgwriter_stats = cur.fetchone()
-
+            db_size = cur.fetchone()[0]
+            
             return {
-                "db_stats": db_stats,
-                "bgwriter_stats": bgwriter_stats
+                "cache_hit_ratio": cache_hit_ratio,
+                "database_size": db_size
             }
     except psycopg2.Error as e:
-        print(f"Error collecting resource usage: {e}")
-        return {}
+        print(f"Error collecting database stats: {e}")
+        return {"cache_hit_ratio": 0, "database_size": "N/A"}
 
-def collect_connection_info(conn):
-    """Collects information about active connections."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    datname,
-                    usename,
-                    application_name,
-                    client_addr,
-                    state,
-                    query,
-                    backend_start,
-                    query_start,
-                    state_change
-                FROM
-                    pg_stat_activity
-                WHERE
-                    pid <> pg_backend_pid();
-            """)
-            return cur.fetchall()
-    except psycopg2.Error as e:
-        print(f"Error collecting connection info: {e}")
-        return []
 
-def collect_lock_info(conn):
-    """Collects information about database locks."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    pg_locks.pid,
-                    pg_locks.mode,
-                    pg_locks.granted,
-                    pg_locks.waitstart,
-                    pg_class.relname AS relation,
-                    pg_stat_activity.query AS blocking_query
-                FROM
-                    pg_locks
-                JOIN
-                    pg_stat_activity ON pg_locks.pid = pg_stat_activity.pid
-                LEFT JOIN
-                    pg_class ON pg_locks.relation = pg_class.oid
-                WHERE
-                    pg_locks.mode IS NOT NULL AND pg_locks.pid <> pg_backend_pid();
-            """)
-            return cur.fetchall()
-    except psycopg2.Error as e:
-        print(f"Error collecting lock info: {e}")
-        return []
+
+
 
 def collect_table_sizes(conn):
-    """Collects sizes of tables and indexes."""
+    """Collects sizes of user tables and their indexes."""
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
-                    relname AS table_name,
-                    pg_size_pretty(pg_relation_size(oid)) AS table_size,
-                    pg_size_pretty(pg_total_relation_size(oid)) AS total_size,
-                    pg_size_pretty(pg_indexes_size(oid)) AS indexes_size
+                    n.nspname as schema_name,
+                    c.relname as table_name,
+                    pg_size_pretty(pg_relation_size(c.oid)) as table_size,
+                    pg_size_pretty(pg_total_relation_size(c.oid)) as total_size,
+                    pg_size_pretty(pg_indexes_size(c.oid)) as index_size,
+                    pg_size_pretty(pg_total_relation_size(c.oid) - pg_relation_size(c.oid) - pg_indexes_size(c.oid)) as toast_size
                 FROM
-                    pg_class
-                WHERE
-                    relkind = 'r'
-                ORDER BY
-                    pg_total_relation_size(oid) DESC;
+                    pg_class c
+                LEFT JOIN 
+                    pg_namespace n ON n.oid = c.relnamespace
+                WHERE 
+                    c.relkind = 'r'
+                    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                    AND n.nspname !~ '^pg_toast'
+                ORDER BY 
+                    pg_total_relation_size(c.oid) DESC;
             """)
             return cur.fetchall()
     except psycopg2.Error as e:
@@ -170,71 +126,103 @@ def collect_table_sizes(conn):
 
 def save_to_csv(data, filename, header):
     """Saves collected data to a CSV file."""
-    filepath = os.path.join(os.path.dirname(__file__), '..', 'data', 'raw', filename)
+    filepath = os.path.join(os.path.dirname(__file__), '..', 'reports', filename)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     try:
         with open(filepath, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(header)
             writer.writerows(data)
-        print(f"Data saved to {filepath}")
+        print(f"Report saved to {filepath}")
     except IOError as e:
-        print(f"Error saving data to CSV: {e}")
+        print(f"Error saving report: {e}")
+
+def generate_markdown_report(query_stats, db_stats, table_sizes, timestamp):
+    """Generates a markdown report with the collected metrics."""
+    report_path = os.path.join(os.path.dirname(__file__), '..', 'reports', f'performance_report_{timestamp}.md')
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    
+    with open(report_path, 'w') as f:
+        # Database Summary
+        f.write("# Database Performance Report\n\n")
+        f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("## Database Summary\n")
+        f.write(f"- **Database Size:** {db_stats['database_size']}\n")
+        f.write(f"- **Cache Hit Ratio:** {db_stats['cache_hit_ratio']}%\n\n")
+        
+        # Query Performance
+        if query_stats:
+            f.write("## Top Slow Queries\n")
+            f.write("| Query | Calls | Total Time (ms) | Avg (ms) | Min (ms) | Max (ms) |\n")
+            f.write("|-------|-------|----------------|----------|----------|----------|\n")
+            for row in query_stats:
+                query = row[0].replace('|', '│')  # Replace pipe in query to avoid markdown issues
+                query = query[:100] + '...' if len(query) > 100 else query
+                f.write(f"| `{query}` | {row[1]} | {row[2]} | {row[3]} | {row[4]} | {row[5]} |\n")
+            f.write("\n")
+        
+        # Table Sizes
+        if table_sizes:
+            f.write("## Table Sizes\n")
+            f.write("| Schema | Table | Table Size | Total Size | Index Size | TOAST Size |\n")
+            f.write("|--------|-------|------------|------------|------------|------------|\n")
+            for row in table_sizes:
+                f.write(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} | {row[5]} |\n")
+    
+    print(f"Generated report: {report_path}")
 
 def main():
     config = configparser.ConfigParser()
     config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'config.ini')
     config.read(config_path)
-
+    
+    print("Starting database performance analysis...")
+    
     conn = get_db_connection(config)
     if not conn:
+        print("Failed to connect to the database. Check your configuration in config.ini")
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    metrics_to_collect = [m.strip() for m in config['collection']['metrics_to_collect'].split(',') if m.strip()]
-
-    if 'query_stats' in metrics_to_collect:
+    
+    try:
+        # Collect database statistics
+        print("Collecting database statistics...")
+        db_stats = collect_database_stats(conn)
+        
+        # Collect query statistics
+        print("Collecting query performance data...")
         query_stats = collect_query_stats(conn)
-        if query_stats:
-            query_stats_header = ['query', 'calls', 'total_exec_time', 'mean_exec_time', 'min_exec_time', 'max_exec_time', 'blk_read_time', 'blk_write_time']
-            save_to_csv(query_stats, f"query_stats_{timestamp}.csv", query_stats_header)
-
-    if 'resource_usage' in metrics_to_collect:
-        resource_usage = collect_resource_usage(conn)
-        if resource_usage:
-            # Flatten dict for CSV saving
-            db_stats_data = [list(resource_usage["db_stats"])] if resource_usage["db_stats"] else []
-            db_stats_header = ['datname', 'blks_read', 'blks_hit', 'hit_ratio']
-            if db_stats_data: # Only save if data exists
-                save_to_csv(db_stats_data, f"db_stats_{timestamp}.csv", db_stats_header)
-
-            bgwriter_stats_data = [list(resource_usage["bgwriter_stats"])] if resource_usage["bgwriter_stats"] else []
-            bgwriter_stats_header = ['checkpoints_timed', 'checkpoints_req', 'buffers_alloc', 'buffers_backend',
-                                     'buffers_backend_fsync', 'buffers_checkpoint', 'buffers_clean',
-                                     'maxwritten_clean', 'buff_alloc_rate', 'checkpoints_rate']
-            if bgwriter_stats_data: # Only save if data exists
-                save_to_csv(bgwriter_stats_data, f"bgwriter_stats_{timestamp}.csv", bgwriter_stats_header)
-
-    if 'connection_info' in metrics_to_collect:
-        connection_info = collect_connection_info(conn)
-        if connection_info:
-            connection_info_header = ['datname', 'usename', 'application_name', 'client_addr', 'state', 'query', 'backend_start', 'query_start', 'state_change']
-            save_to_csv(connection_info, f"connection_info_{timestamp}.csv", connection_info_header)
-
-    if 'lock_info' in metrics_to_collect:
-        lock_info = collect_lock_info(conn)
-        if lock_info:
-            lock_info_header = ['pid', 'mode', 'granted', 'waitstart', 'relation', 'blocking_query']
-            save_to_csv(lock_info, f"lock_info_{timestamp}.csv", lock_info_header)
-
-    if 'table_sizes' in metrics_to_collect:
+        
+        # Collect table sizes
+        print("Collecting table size information...")
         table_sizes = collect_table_sizes(conn)
+        
+        # Generate report
+        print("Generating report...")
+        generate_markdown_report(query_stats, db_stats, table_sizes, timestamp)
+        
+        # Save raw data for reference
+        if query_stats:
+            save_to_csv(
+                query_stats, 
+                f"query_stats_{timestamp}.csv",
+                ['query', 'calls', 'total_ms', 'avg_ms', 'min_ms', 'max_ms', 'avg_seconds']
+            )
+            
         if table_sizes:
-            table_sizes_header = ['table_name', 'table_size', 'total_size', 'indexes_size']
-            save_to_csv(table_sizes, f"table_sizes_{timestamp}.csv", table_sizes_header)
-
-    conn.close()
+            save_to_csv(
+                table_sizes,
+                f"table_sizes_{timestamp}.csv",
+                ['schema', 'table_name', 'table_size', 'total_size', 'index_size', 'toast_size']
+            )
+            
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        conn.close()
+        print("Analysis completed.")
 
 if __name__ == "__main__":
     main()
