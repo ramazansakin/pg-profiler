@@ -31,15 +31,28 @@ def collect_query_stats(conn):
                 print("Warning: pg_stat_statements extension is not enabled. Skipping query stats.")
                 return []
 
-            # Reset stats to get fresh data
+            # Get current timestamp for the report
+            import time
+            start_time = time.time()
+            
+            print("\n=== Query Collection Started ===")
+            print("1. First, we'll reset the query statistics")
             cur.execute("SELECT pg_stat_statements_reset()")
             
-            # Wait a bit to capture some queries
-            print("Capturing query stats for 5 seconds...")
-            import time
-            time.sleep(5)
+            print("2. Now, please run your application queries for the next 60 seconds...")
+            print("   (This gives you time to trigger the custom queries you want to profile)")
+            print("   Press Ctrl+C to stop early if you've run your queries\n")
             
-            # Get the top 50 queries by total execution time
+            try:
+                # Wait for 60 seconds to capture queries
+                for i in range(60, 0, -1):
+                    print(f"\rTime remaining: {i} seconds (or press Ctrl+C to stop) ", end="")
+                    time.sleep(1)
+                print("\n")
+            except KeyboardInterrupt:
+                print("\n\nCapture stopped early. Processing collected data...\n")
+            
+            # Get the top 100 queries by total execution time
             cur.execute("""
                 SELECT
                     query,
@@ -52,11 +65,20 @@ def collect_query_stats(conn):
                 FROM
                     pg_stat_statements
                 WHERE
-                    query NOT LIKE '%pg_%'  -- Exclude PostgreSQL internal queries
+                    -- Exclude PostgreSQL internal queries and system tables
+                    query NOT LIKE '%pg_%' 
                     AND query NOT LIKE '%information_schema%'
+                    AND query NOT LIKE '%pg_catalog%'
+                    -- Include only SELECT, INSERT, UPDATE, DELETE queries
+                    AND (
+                        query ILIKE 'SELECT%' 
+                        OR query ILIKE 'INSERT%' 
+                        OR query ILIKE 'UPDATE%' 
+                        OR query ILIKE 'DELETE%'
+                    )
                 ORDER BY
                     total_exec_time DESC
-                LIMIT 50;
+                LIMIT 100;
             """)
             return cur.fetchall()
     except psycopg2.Error as e:
