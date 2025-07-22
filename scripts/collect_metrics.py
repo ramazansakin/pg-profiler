@@ -80,8 +80,8 @@ def collect_resource_usage(conn):
                     buffers_checkpoint,
                     buffers_clean,
                     maxwritten_clean,
-                    buff_alloc_rate = (buffers_alloc / (EXTRACT(EPOCH FROM (now() - stats_reset))))::numeric(10,2),
-                    checkpoints_rate = ((checkpoints_timed + checkpoints_req) / (EXTRACT(EPOCH FROM (now() - stats_reset))))::numeric(10,2)
+                    (buffers_alloc / (EXTRACT(EPOCH FROM (now() - stats_reset))))::numeric(10,2) AS buff_alloc_rate,
+                    ((checkpoints_timed + checkpoints_req) / (EXTRACT(EPOCH FROM (now() - stats_reset))))::numeric(10,2) AS checkpoints_rate
                 FROM
                     pg_stat_bgwriter;
             """)
